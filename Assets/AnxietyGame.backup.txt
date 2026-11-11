@@ -1,0 +1,625 @@
+using UnityEngine;
+using UnityEngine.AI;
+using UnityEngine.SceneManagement;
+using System.Collections.Generic;
+#if ENABLE_INPUT_SYSTEM
+using UnityEngine.InputSystem;
+#endif
+
+// JENGA - an anxiety simulator.
+// Reach the DEADLINE (the pale beam of light) before the clock runs out.
+// The clock, falling blocks, whispers and the maze push anxiety up; anxiety slows you,
+// narrows your vision and can tip into a panic attack. Holding E / right mouse lets you
+// stop and breathe: it calms you, but the clock keeps running.
+// Just as you get close, the deadline slips away once - you tried so hard, and it moved.
+public class AnxietyGame : MonoBehaviour
+{
+    public enum State { Intro, Playing, Won, Lost }
+    public State state = State.Intro;
+
+    [Header("References")]
+    public MazeWalker walker;
+    public AnxietyDirector director;
+    public FallingBlocks blocks;
+    public WhisperSystem whispers;
+    public Material beamMaterial;
+
+    [Header("Rules")]
+    [Tooltip("0 = work it out from the maze (tight but fair).")]
+    public float timeLimit = 0f;
+    public float hitPenalty = 8f;
+    public int goalSlips = 1;
+    public float slipDistance = 14f;
+    public float reachDistance = 2.2f;
+    public float difficulty = 1f;   // >1 = less time
+    [Tooltip("The whole run is one long panic attack.")]
+    public bool fullPanic = false;
+    [Tooltip("Write intrusive thoughts on walls / falling blocks instead of on the screen.")]
+    public bool thoughtsOnWalls = true;
+    public ThoughtWriter writer;
+    [HideInInspector] public bool forceBreath;   // used by GameplayRecorder to hold a breath
+    [Tooltip("Average speed assumed when working out the time limit (m/s).")]
+    public float assumedSpeed = 1.9f;
+
+    float timeLeft, totalTime;
+    Vector3 startPos, goalA, goalB, goal;
+    int slipsLeft;
+    Transform beacon;
+    Light beaconLight;
+    float beaconFlicker;
+    float breathingCalm;
+    bool breathing;
+    float runTime;
+    float endFade;
+    float penaltyFlash;
+    string penaltyText = "";
+    float banner; string bannerText = "";
+    float introTime;
+    const float IntroReady = 8f;
+
+    class Thought { public string text; public Vector2 pos; public float born, life; public int size; }
+    readonly List<Thought> thoughts = new List<Thought>();
+
+    void Start()
+    {
+        if (walker == null) walker = FindFirstObjectByType<MazeWalker>();
+        if (director == null) director = FindFirstObjectByType<AnxietyDirector>();
+        if (blocks == null) blocks = FindFirstObjectByType<FallingBlocks>();
+        if (whispers == null) whispers = FindFirstObjectByType<WhisperSystem>();
+        if (whispers) whispers.onWhisper += ShowThought;
+        FallingBlocks.OnPlayerHit += OnHit;
+
+        startPos = walker.transform.position;
+        PlanGoals();
+        slipsLeft = goalSlips;
+        goal = goalA;
+        BuildBeacon();
+
+        walker.showHelp = false;
+        walker.frozen = true;
+        if (blocks) blocks.spawning = false;
+        if (whispers) whispers.active = false;
+        director.externalDread = 0.15f;
+        Cursor.lockState = CursorLockMode.None; Cursor.visible = true;
+    }
+
+    void OnDestroy()
+    {
+        FallingBlocks.OnPlayerHit -= OnHit;
+        if (whispers) whispers.onWhisper -= ShowThought;
+    }
+
+    // ---------- planning the route ----------
+    static float PathLength(Vector3 a, Vector3 b)
+    {
+        var p = new NavMeshPath();
+        if (!NavMesh.CalculatePath(a, b, NavMesh.AllAreas, p) || p.status != NavMeshPathStatus.PathComplete) return -1f;
+        float L = 0f; for (int i = 1; i < p.corners.Length; i++) L += Vector3.Distance(p.corners[i - 1], p.corners[i]);
+        return L;
+    }
+
+    static bool InCorridor(Vector3 p)
+    {
+        Vector3 o = p + Vector3.up; int c = 0;
+        if (Physics.Raycast(o, Vector3.forward, 3.5f)) c++;
+        if (Physics.Raycast(o, Vector3.back, 3.5f)) c++;
+        if (Physics.Raycast(o, Vector3.left, 3.5f)) c++;
+        if (Physics.Raycast(o, Vector3.right, 3.5f)) c++;
+        return c >= 2;
+    }
+
+    void PlanGoals()
+    {
+        NavMeshHit h;
+        if (NavMesh.SamplePosition(startPos, out h, 5f, NavMesh.AllAreas)) startPos = h.position;
+        var tri = NavMesh.CalculateTriangulation();
+        float bestA = -1f; goalA = startPos;
+        float lenA = 0f, lenB = 0f;
+        // goal A: far-ish through the corridors, but not absurdly far
+        for (int i = 0; i < 250; i++)
+        {
+            Vector3 p = tri.vertices[Random.Range(0, tri.vertices.Length)];
+            if (!InCorridor(p)) continue;
+            float L = PathLength(startPos, p);
+            if (L < 0f) continue;
+            float score = -Mathf.Abs(L - 110f);           // aim for ~110 m of walking
+            if (score > bestA) { bestA = score; goalA = p; lenA = L; }
+        }
+        // goal B: where the deadline slips to - further on, 40-70 m from A
+        float bestB = -1e9f; goalB = goalA;
+        for (int i = 0; i < 250; i++)
+        {
+            Vector3 p = tri.vertices[Random.Range(0, tri.vertices.Length)];
+            if (!InCorridor(p)) continue;
+            float L = PathLength(goalA, p);
+            if (L < 0f) continue;
+            float score = -Mathf.Abs(L - 55f) + Vector3.Distance(p, startPos) * 0.2f;
+            if (score > bestB) { bestB = score; goalB = p; lenB = L; }
+        }
+        if (timeLimit <= 0f)
+        {
+            // walking ~2.4 m/s when anxious, people get lost (x1.7), plus some slack
+            float total = (lenA + (goalSlips > 0 ? lenB : 0f)) / assumedSpeed * 1.6f + 25f;
+            timeLimit = Mathf.Clamp(total / Mathf.Max(0.5f, difficulty), 90f, 360f);
+        }
+        totalTime = timeLeft = timeLimit;
+    }
+
+    void BuildBeacon()
+    {
+        var root = new GameObject("DEADLINE");
+        beacon = root.transform;
+        var beam = GameObject.CreatePrimitive(PrimitiveType.Cylinder);
+        Destroy(beam.GetComponent<Collider>());
+        beam.transform.SetParent(beacon, false);
+        beam.transform.localScale = new Vector3(0.25f, 45f, 0.25f);
+        beam.transform.localPosition = new Vector3(0, 45f, 0);
+        var r = beam.GetComponent<Renderer>();
+        if (beamMaterial) r.sharedMaterial = beamMaterial;
+        r.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+        var lg = new GameObject("glow"); lg.transform.SetParent(beacon, false); lg.transform.localPosition = Vector3.up * 2f;
+        beaconLight = lg.AddComponent<Light>(); beaconLight.type = LightType.Point; beaconLight.range = 10f; beaconLight.intensity = 6f;
+        beacon.position = goal;
+    }
+
+    // ---------- events ----------
+    void OnHit()
+    {
+        if (state != State.Playing) return;
+        timeLeft -= hitPenalty;
+        hits++;
+        penaltyFlash = 1.5f; penaltyText = "-" + hitPenalty.ToString("0") + "s";
+        if (whispers) whispers.Burst(2);
+    }
+
+    void ShowThought(int idx)
+    {
+        if (state != State.Playing || idx < 0 || idx >= WhisperSystem.Lines.Length) return;
+        // fewer words than voices: only some whispers get written down
+        float a = director ? director.anxiety : 0.5f;
+        if (Random.value > Mathf.Lerp(0.5f, 0.9f, a)) return;
+        if (thoughtsOnWalls)
+        {
+            if (writer == null) writer = FindFirstObjectByType<ThoughtWriter>();
+            if (writer != null) { writer.Write(WhisperSystem.Lines[idx]); return; }
+        }
+        // keep thoughts in the periphery, never right in the middle
+        Vector2 p;
+        do { p = new Vector2(Random.Range(0.08f, 0.92f), Random.Range(0.12f, 0.88f)); }
+        while (Mathf.Abs(p.x - 0.5f) < 0.18f && Mathf.Abs(p.y - 0.5f) < 0.18f);
+        thoughts.Add(new Thought { text = WhisperSystem.Lines[idx], pos = p, born = Time.time, life = Random.Range(2f, 3.5f), size = Random.Range(18, 34) });
+    }
+
+    // ---------- loop ----------
+bool AnyStartInput()
+    {
+#if ENABLE_INPUT_SYSTEM
+        return (Keyboard.current != null && (Keyboard.current.spaceKey.wasPressedThisFrame || Keyboard.current.enterKey.wasPressedThisFrame)) || (Mouse.current != null && Mouse.current.leftButton.wasPressedThisFrame);
+#else
+        return Input.GetKeyDown(KeyCode.Space) || Input.GetKeyDown(KeyCode.Return) || Input.GetMouseButtonDown(0);
+#endif
+    }
+bool BreathHeld()
+    {
+#if ENABLE_INPUT_SYSTEM
+        return (Keyboard.current != null && Keyboard.current.spaceKey.isPressed) || (Mouse.current != null && Mouse.current.rightButton.isPressed);
+#else
+        return Input.GetKey(KeyCode.Space) || Input.GetMouseButton(1);
+#endif
+    }
+bool RestartPressed()
+    {
+#if ENABLE_INPUT_SYSTEM
+        return Keyboard.current != null && (Keyboard.current.spaceKey.wasPressedThisFrame || Keyboard.current.rKey.wasPressedThisFrame);
+#else
+        return Input.GetKeyDown(KeyCode.Space) || Input.GetKeyDown(KeyCode.R);
+#endif
+    }
+
+    void Update()
+    {
+        float dt = Time.deltaTime;
+        switch (state)
+        {
+            case State.Intro:
+                introTime += dt;
+                walker.inputEnabled = false;
+                walker.pitchOffset = -24f + Mathf.Sin(introTime * 0.25f) * 6f;   // looking up at the towering walls
+                if (AnyStartInput()) { if (introTime < IntroReady) introTime = IntroReady; else Begin(); }
+                break;
+            case State.Playing:
+                Tick(dt);
+                break;
+            default:
+                endFade = Mathf.MoveTowards(endFade, 1f, dt * 0.5f);
+                if (endFade > 0.6f && RestartPressed()) SceneManager.LoadScene(SceneManager.GetActiveScene().name);
+                break;
+        }
+
+        // beacon: slow pulse, flickers out when it slips
+        if (beacon)
+        {
+            beaconFlicker = Mathf.MoveTowards(beaconFlicker, 0f, dt);
+            bool on = beaconFlicker <= 0f || Random.value > 0.6f;
+            foreach (var rr in beacon.GetComponentsInChildren<Renderer>()) rr.enabled = on;
+            if (beaconLight) beaconLight.intensity = on ? 5f + Mathf.Sin(Time.time * 2f) * 1.5f : 0f;
+        }
+        for (int i = thoughts.Count - 1; i >= 0; i--) if (Time.time - thoughts[i].born > thoughts[i].life) thoughts.RemoveAt(i);
+        penaltyFlash = Mathf.MoveTowards(penaltyFlash, 0f, dt);
+        banner = Mathf.MoveTowards(banner, 0f, dt);
+    }
+
+    void Begin()
+    {
+        state = State.Playing;
+        walker.frozen = false;
+        walker.enabled = true;
+        walker.inputEnabled = true;
+        Cursor.lockState = CursorLockMode.Locked; Cursor.visible = false;
+        if (blocks) blocks.spawning = true;
+        if (whispers) whispers.active = true;
+        director.alwaysPanic = fullPanic;
+        Banner("Find the way out.");
+    }
+
+    void Banner(string s) { bannerText = s; banner = 3f; }
+
+    void Tick(float dt)
+    {
+        runTime += dt;
+        timeLeft -= dt;
+        walker.pitchOffset = Mathf.MoveTowards(walker.pitchOffset, 0f, dt * 15f);   // lower your gaze as the run begins
+
+        // time pressure drives the background dread
+        float pressure = 1f - Mathf.Clamp01(timeLeft / totalTime);
+        director.externalDread = fullPanic ? Mathf.Lerp(0.85f, 1f, pressure) : Mathf.Lerp(0.2f, 0.85f, pressure) + (timeLeft < 20f ? 0.1f : 0f);
+
+        // breathing: stop, slow down, the world quiets a little - but the clock keeps going
+        breathing = BreathHeld() || forceBreath;
+        breathingCalm = Mathf.MoveTowards(breathingCalm, breathing ? 1f : 0f, dt * (breathing ? 0.35f : 0.8f));
+        director.calm = breathingCalm;
+        walker.frozen = breathing;
+
+        float dist = Vector3.Distance(Flat(walker.transform.position), Flat(goal));
+        if (slipsLeft > 0 && dist < slipDistance)
+        {
+            // so close... and it moves.
+            slipsLeft--;
+            goal = goalB;
+            beacon.position = goal;
+            beaconFlicker = 1.2f;
+            director.AddShock(0.7f, 0.35f);
+            if (whispers) whispers.Burst(3);
+            Banner("It moved.");
+        }
+        else if (slipsLeft == 0 && dist < reachDistance)
+        {
+            End(State.Won);
+            return;
+        }
+
+        if (timeLeft <= 0f) { timeLeft = 0f; End(State.Lost); }
+    }
+
+    static Vector3 Flat(Vector3 v) { v.y = 0; return v; }
+
+    void End(State s)
+    {
+        state = s;
+        walker.frozen = true;
+        if (blocks) blocks.spawning = false;
+        if (whispers) whispers.active = s == State.Lost; // the voices don't stop if you lose
+        director.calm = s == State.Won ? 1f : 0f;
+        director.alwaysPanic = s == State.Lost && fullPanic;
+        director.externalDread = s == State.Won ? 0f : 0.9f;
+        Cursor.lockState = CursorLockMode.None; Cursor.visible = true;
+        endFade = 0f;
+    }
+
+    // ---------- HUD ----------
+    // Drawn with MindMazeUI (Inter, in Assets/Resources/Fonts). Authored for 1080p and scaled.
+    int hits;
+    float heartPhase, heartBeat;   // heartbeat for the pulse readout
+    float breathVis;               // fades the breathing ring in/out
+
+    static string MMSS(float t) { int x = Mathf.Max(0, Mathf.CeilToInt(t)); return (x / 60).ToString("00") + ":" + (x % 60).ToString("00"); }
+    static float Ease(float t) { t = Mathf.Clamp01(t); return 1f - (1f - t) * (1f - t) * (1f - t); }
+
+    void LateUpdate()
+    {
+        float a = director ? director.anxiety : 0f;
+        float bpm = Mathf.Lerp(66f, 150f, a);
+        heartPhase += Time.deltaTime * bpm / 60f;
+        if (heartPhase >= 1f) { heartPhase -= 1f; heartBeat = 1f; }
+        heartBeat = Mathf.MoveTowards(heartBeat, 0f, Time.deltaTime * 4f);
+        breathVis = Mathf.MoveTowards(breathVis, state == State.Playing && breathing ? 1f : 0f, Time.deltaTime * 3f);
+    }
+
+    void OnGUI()
+    {
+        if (!MindMazeUI.Repaint) return;
+        MindMazeUI.Init();
+        GUI.depth = -10;
+        if (BlockoutMode.Active) { DrawBlockoutHud(); return; }
+        if (state == State.Intro) DrawIntro();
+        else if (state == State.Playing) DrawHud();
+        else DrawEnd();
+    }
+
+    // ---------- greybox placeholder UI (process videos) ----------
+    GUIStyle dbg, dbgBig;
+    void DrawBlockoutHud()
+    {
+        float s = MindMazeUI.S, W = MindMazeUI.W, H = MindMazeUI.H;
+        if (dbg == null) { dbg = new GUIStyle(GUI.skin.box) { alignment = TextAnchor.UpperLeft }; dbgBig = new GUIStyle(GUI.skin.box) { alignment = TextAnchor.MiddleCenter }; }
+        dbg.fontSize = Mathf.RoundToInt(18 * s); dbg.padding = new RectOffset(Mathf.RoundToInt(12 * s), 0, Mathf.RoundToInt(10 * s), 0);
+        dbgBig.fontSize = Mathf.RoundToInt(34 * s);
+        float a = director ? director.anxiety : 0f;
+        string info = "BLOCKOUT  build 0.1\n" +
+                      "state: " + state + "\n" +
+                      "time left: " + timeLeft.ToString("0.0") + " s\n" +
+                      "anxiety: " + a.ToString("0.00") + (director && director.panicking ? "  (PANIC)" : "") + "\n" +
+                      "breathing: " + (breathing ? "yes" : "no") + "   hits: " + hits + "\n" +
+                      "goal dist: " + (walker ? Vector3.Distance(Flat(walker.transform.position), Flat(goal)).ToString("0.0") : "-") + " m";
+        GUI.Box(new Rect(20 * s, 20 * s, 380 * s, 190 * s), info, dbg);
+        if (state == State.Intro)
+            GUI.Box(new Rect(W * 0.5f - 360 * s, H * 0.4f, 720 * s, 140 * s), "MIND MAZE  [title placeholder]\npress SPACE to start", dbgBig);
+        else if (state == State.Playing && banner > 0f)
+            GUI.Box(new Rect(W * 0.5f - 300 * s, H * 0.3f, 600 * s, 80 * s), "[banner] " + bannerText, dbgBig);
+        else if (state != State.Playing)
+            GUI.Box(new Rect(W * 0.5f - 360 * s, H * 0.4f, 720 * s, 140 * s), (state == State.Won ? "WIN" : "LOSE") + "  [end screen placeholder]\npress SPACE to restart", dbgBig);
+    }
+
+    // ---------- title / opening sequence ----------
+    void DrawIntro()
+    {
+        float W = MindMazeUI.W, H = MindMazeUI.H, s = MindMazeUI.S, t = introTime;
+        var bone = MindMazeUI.Bone; var ash = MindMazeUI.Ash;
+
+        // fade up from black into a dim view of the towering walls
+        MindMazeUI.FillScreen(new Color(0, 0, 0, Mathf.Lerp(1f, 0.35f, Mathf.Clamp01((t - 0.3f) / 2.5f))));
+        MindMazeUI.VignetteScreen(new Color(0, 0, 0, 0.9f), 1.15f);
+
+        // 1. "You are entering a maze of thoughts..." typed out, then dissolves
+        string line = "You are entering a maze of thoughts…";
+        int chars = Mathf.Clamp(Mathf.FloorToInt((t - 0.8f) * 14f), 0, line.Length);
+        float aLine = t < 4.2f ? 1f : Mathf.Clamp01(1f - (t - 4.2f) / 0.9f);
+        if (chars > 0 && aLine > 0f)
+        {
+            float fs = 30f * s;
+            string shown = line.Substring(0, chars);
+            float full = MindMazeUI.Measure(line, MindMazeUI.Italic, fs).x;
+            float x0 = W * 0.5f - full * 0.5f;
+            MindMazeUI.Label(new Rect(x0, H * 0.5f - fs, full + 40, fs * 2f), shown, MindMazeUI.Italic, fs, MindMazeUI.A(bone, 0.9f * aLine), TextAnchor.MiddleLeft);
+            float w = MindMazeUI.Measure(shown, MindMazeUI.Italic, fs).x;
+            if (Mathf.Repeat(Time.time, 0.9f) < 0.55f || chars < line.Length)
+                MindMazeUI.Fill(new Rect(x0 + w + 4f * s, H * 0.5f - fs * 0.5f, Mathf.Max(1.5f, 2f * s), fs), MindMazeUI.A(bone, 0.75f * aLine));
+        }
+
+        float aTitle = Mathf.Clamp01((t - 5f) / 1.2f);
+        if (aTitle <= 0f) return;
+
+        // left-hand shade so the menu reads over the walls
+        MindMazeUI.Tex(new Rect(0, 0, W * 0.62f, H), MindMazeUI.GradH, new Color(0, 0, 0, 0.82f * aTitle));
+
+        float L = 112f * s;                     // left margin
+        float y = H * 0.25f;
+
+        // 2. title block
+        float ts = Mathf.Min(124f * s, W * 0.08f);
+        float slide = (1f - Ease((t - 5f) / 1.4f)) * 24f * s;
+        MindMazeUI.Label(new Rect(L - 6f * s + slide, y, W, ts * 1.3f), "Mind Maze", MindMazeUI.Display, ts, MindMazeUI.A(bone, aTitle), TextAnchor.MiddleLeft, false, 0.9f);
+        y += ts * 1.3f + 4f * s;
+
+        float aAbout = Mathf.Clamp01((t - 6.1f) / 1f);
+        MindMazeUI.Label(new Rect(L, y, W, 40f * s), "A walk through a panic attack.", MindMazeUI.BodyMedium, 28f * s, MindMazeUI.A(bone, 0.95f * aAbout), TextAnchor.MiddleLeft);
+        y += 52f * s;
+        float dw = 520f * s;
+        string desc = "Find your way out before the deadline, while your own mind closes the walls in.";
+        float dh = MindMazeUI.Height(desc, MindMazeUI.Body, 19f * s, dw);
+        MindMazeUI.Label(new Rect(L, y, dw, dh), desc, MindMazeUI.Body, 19f * s, MindMazeUI.A(ash, aAbout), TextAnchor.UpperLeft, true);
+        y += dh + 56f * s;
+
+        // 3. controls, as a plain list
+        float aCtl = Mathf.Clamp01((t - 7f) / 1f);
+        if (aCtl > 0f) y = DrawControlsList(L, y, aCtl);
+
+        // 4. start prompt
+        if (t >= IntroReady)
+        {
+            float p = 0.6f + 0.4f * Mathf.Abs(Mathf.Sin(Time.time * 1.6f));
+            MindMazeUI.PromptLeft(new Vector2(L, y + 40f * s), "Press", "Space", "to begin", 20f * s, p * Mathf.Clamp01((t - IntroReady) / 0.6f));
+        }
+
+        // footer
+        MindMazeUI.Label(new Rect(L, H - 64f * s, W * 0.5f, 30f * s), "Contains depictions of panic and anxiety.", MindMazeUI.Body, 14f * s, MindMazeUI.A(MindMazeUI.Dim, aTitle), TextAnchor.MiddleLeft);
+        MindMazeUI.Label(new Rect(W * 0.5f, H - 64f * s, W * 0.5f - 48f * s, 30f * s), "Best with headphones", MindMazeUI.Body, 14f * s, MindMazeUI.A(MindMazeUI.Dim, aTitle), TextAnchor.MiddleRight);
+        if (t < IntroReady)
+            MindMazeUI.Label(new Rect(W * 0.5f, 28f * s, W * 0.5f - 48f * s, 30f * s), "Space to skip", MindMazeUI.Body, 14f * s, MindMazeUI.A(MindMazeUI.Dim, 0.9f), TextAnchor.MiddleRight);
+    }
+
+    float DrawControlsList(float L, float y, float alpha)
+    {
+        float s = MindMazeUI.S;
+        float capH = 34f * s, kgap = 6f * s, row = 48f * s;
+        float labelX = L + capH * 2f + kgap + 22f * s;
+        string[] labels = { "Walk", "Turn", "Look around", "Breathe (hold)" };
+        for (int i = 0; i < 4; i++)
+        {
+            float cy = y + capH * 0.5f;
+            float c0 = L + capH * 0.5f, c1 = L + capH * 1.5f + kgap;
+            switch (i)
+            {
+                case 0: MindMazeUI.KeyCap(new Vector2(c0, cy), "", capH, alpha, MindMazeUI.Glyph.Up); MindMazeUI.KeyCap(new Vector2(c1, cy), "", capH, alpha, MindMazeUI.Glyph.Down); break;
+                case 1: MindMazeUI.KeyCap(new Vector2(c0, cy), "", capH, alpha, MindMazeUI.Glyph.Left); MindMazeUI.KeyCap(new Vector2(c1, cy), "", capH, alpha, MindMazeUI.Glyph.Right); break;
+                case 2: { float w = capH * 2f + kgap; var r = new Rect(L, y, w, capH); KeyRect(r, "Mouse", alpha); } break;
+                case 3: { float w = capH * 2f + kgap; var r = new Rect(L, y, w, capH); KeyRect(r, "Space", alpha); } break;
+            }
+            MindMazeUI.Label(new Rect(labelX, y, 400f * s, capH), labels[i], MindMazeUI.BodyMedium, 17f * s, MindMazeUI.A(MindMazeUI.Bone, 0.85f * alpha), TextAnchor.MiddleLeft);
+            y += row;
+        }
+        return y;
+    }
+
+    static void KeyRect(Rect r, string label, float alpha)
+    {
+        float s = MindMazeUI.S;
+        MindMazeUI.Sliced(new Rect(r.x, r.y + 3f * s, r.width, r.height), MindMazeUI.KeyFill, new Color(0, 0, 0, 0.55f * alpha));
+        MindMazeUI.Sliced(r, MindMazeUI.KeyFill, new Color(0.05f, 0.05f, 0.06f, 0.75f * alpha));
+        MindMazeUI.Sliced(r, MindMazeUI.KeyLine, MindMazeUI.A(MindMazeUI.Bone, 0.7f * alpha));
+        MindMazeUI.Label(new Rect(r.x, r.y - 1f * s, r.width, r.height), label, MindMazeUI.Cond, r.height * 0.42f, MindMazeUI.A(MindMazeUI.Bone, 0.95f * alpha), TextAnchor.MiddleCenter, false, 0f);
+    }
+
+    // ---------- in-game HUD ----------
+    void DrawHud()
+    {
+        float W = MindMazeUI.W, H = MindMazeUI.H, s = MindMazeUI.S;
+        float a = director ? director.anxiety : 0f;
+        var bone = MindMazeUI.Bone; var ash = MindMazeUI.Ash; var ember = MindMazeUI.Ember;
+        bool low = timeLeft < 30f;
+        float lowPulse = low ? Mathf.Abs(Mathf.Sin(Time.time * 6f)) : 0f;
+
+        // edge pressure: red at the edges when time is short or panic hits
+        bool panic = director && director.panicking && !breathing;
+        float edge = (low ? 0.10f + 0.12f * lowPulse : 0f) + (panic ? 0.18f + 0.12f * Mathf.Abs(Mathf.Sin(Time.time * 9f)) : 0f);
+        if (edge > 0f) MindMazeUI.VignetteScreen(MindMazeUI.A(ember, edge), 1.25f);
+
+        // --- deadline clock (top centre), shaking with anxiety ---
+        Vector2 jit = Random.insideUnitCircle * a * a * 4f * s;
+        float cx = W * 0.5f + jit.x, top = jit.y;
+        MindMazeUI.Tex(new Rect(cx - 260f * s, top - 100f * s, 520f * s, 280f * s), MindMazeUI.Glow, new Color(0, 0, 0, 0.5f));
+        MindMazeUI.Label(new Rect(cx - 150f * s, top + 22f * s, 300f * s, 24f * s), "Deadline", MindMazeUI.BodyMedium, 15f * s, MindMazeUI.A(low ? ember : ash, 0.95f));
+        Color clockCol = low ? Color.Lerp(bone, ember, 0.35f + 0.65f * lowPulse) : bone;
+        MindMazeUI.Clock(new Vector2(cx, top + 74f * s), MMSS(timeLeft), MindMazeUI.Cond, (low ? 62f : 54f) * s, clockCol);
+        float bw = 180f * s;
+        MindMazeUI.Bar(new Rect(cx - bw * 0.5f, top + 112f * s, bw, Mathf.Max(2f, 3f * s)), timeLeft / Mathf.Max(1f, totalTime), low ? ember : bone, 0.8f);
+
+        // penalty: floats up from under the clock
+        if (penaltyFlash > 0f)
+        {
+            float k = penaltyFlash / 1.5f;
+            MindMazeUI.Label(new Rect(cx - 100f * s, top + 124f * s + (k - 1f) * 24f * s, 200f * s, 44f * s), penaltyText.Replace("-", "−"), MindMazeUI.Cond, 28f * s, MindMazeUI.A(ember, k));
+        }
+
+        // --- banner (story beats) ---
+        if (banner > 0f)
+        {
+            float k = banner > 2.4f ? (3f - banner) / 0.6f : Mathf.Clamp01(banner / 0.8f);
+            float fs = 42f * s;
+            float tw = MindMazeUI.Measure(bannerText, MindMazeUI.DisplayItalic, fs).x;
+            float by = H * 0.33f;
+            MindMazeUI.Tex(new Rect(W * 0.5f - tw * 0.9f, by - fs * 1.4f, tw * 1.8f, fs * 2.8f), MindMazeUI.Glow, new Color(0, 0, 0, 0.55f * k));
+            MindMazeUI.Label(new Rect(0, by - fs, W, fs * 2f), bannerText, MindMazeUI.DisplayItalic, fs, MindMazeUI.A(bone, k));
+        }
+
+        // --- intrusive thoughts in the corners of your eyes (when not written on walls) ---
+        foreach (var th in thoughts)
+        {
+            float k = (Time.time - th.born) / th.life;
+            float alpha = Mathf.Sin(Mathf.Clamp01(k) * Mathf.PI) * Mathf.Lerp(0.35f, 0.85f, a);
+            Vector2 j = Random.insideUnitCircle * (1f + a * 2f) * s;
+            MindMazeUI.Label(new Rect(th.pos.x * W - 300f * s + j.x, th.pos.y * H - 40f * s + j.y, 600f * s, 80f * s), th.text, MindMazeUI.Italic, th.size * 1.1f * s, MindMazeUI.A(bone, alpha));
+        }
+
+        // --- anxiety meter (bottom left) ---
+        {
+            float x0 = 48f * s, y0 = H - 96f * s;
+            MindMazeUI.Tex(new Rect(-140f * s, H - 240f * s, 560f * s, 340f * s), MindMazeUI.Glow, new Color(0, 0, 0, 0.5f));
+            MindMazeUI.Label(new Rect(x0, y0 - 12f * s, 200f * s, 24f * s), "Anxiety", MindMazeUI.BodyMedium, 15f * s, MindMazeUI.A(ash, 0.95f), TextAnchor.MiddleLeft);
+            int segs = 16; float sw = 7f * s, sg = 4f * s, sh = 20f * s;
+            int lit = Mathf.RoundToInt(a * segs);
+            for (int i = 0; i < segs; i++)
+            {
+                float k = i / (segs - 1f);
+                Color c = Color.Lerp(bone, ember, Mathf.Clamp01((k - 0.35f) / 0.5f));
+                float hh = sh * (i < lit ? 1f : 0.55f);
+                MindMazeUI.Fill(new Rect(x0 + i * (sw + sg), y0 + 20f * s + (sh - hh), sw, hh), MindMazeUI.A(c, i < lit ? 0.9f : 0.18f));
+            }
+            float hx = x0 + segs * (sw + sg) + 20f * s, hy = y0 + 20f * s + sh * 0.5f;
+            float r = (8f + 6f * heartBeat) * s;
+            Color hc = Color.Lerp(bone, ember, a);
+            MindMazeUI.Tex(new Rect(hx - r * 2f, hy - r * 2f, r * 4f, r * 4f), MindMazeUI.Glow, MindMazeUI.A(hc, 0.35f + 0.5f * heartBeat));
+            MindMazeUI.Tex(new Rect(hx - 4f * s, hy - 4f * s, 8f * s, 8f * s), MindMazeUI.Glow, MindMazeUI.A(hc, 1f));
+            int bpm = Mathf.RoundToInt(Mathf.Lerp(66f, 150f, a));
+            MindMazeUI.Label(new Rect(hx + 16f * s, hy - 20f * s, 140f * s, 40f * s), bpm + " bpm", MindMazeUI.Cond, 18f * s, MindMazeUI.A(bone, 0.9f), TextAnchor.MiddleLeft);
+        }
+
+        // --- breathing ring ---
+        if (breathVis > 0f)
+        {
+            float p = Mathf.Repeat(Time.time, 8f) / 8f;               // 4 s in, 4 s out
+            bool inhale = p < 0.5f;
+            float k = inhale ? Ease(p * 2f) : 1f - Ease((p - 0.5f) * 2f);
+            float rr = Mathf.Lerp(60f, 100f, k) * s;
+            Vector2 c = new Vector2(W * 0.5f, H * 0.66f);
+            MindMazeUI.Tex(new Rect(c.x - rr * 1.9f, c.y - rr * 1.9f, rr * 3.8f, rr * 3.8f), MindMazeUI.Glow, MindMazeUI.A(MindMazeUI.Breath, 0.2f * breathVis));
+            MindMazeUI.Tex(new Rect(c.x - rr, c.y - rr, rr * 2f, rr * 2f), MindMazeUI.Ring, MindMazeUI.A(MindMazeUI.Breath, 0.8f * breathVis));
+            MindMazeUI.Label(new Rect(c.x - 150f * s, c.y - 30f * s, 300f * s, 60f * s), inhale ? "Breathe in" : "Breathe out", MindMazeUI.BodyMedium, 22f * s, MindMazeUI.A(bone, 0.95f * breathVis));
+            float cw = 140f * s;
+            MindMazeUI.Label(new Rect(c.x - 100f * s, c.y + 112f * s, 200f * s, 22f * s), "Calm", MindMazeUI.BodyMedium, 13f * s, MindMazeUI.A(ash, 0.9f * breathVis));
+            MindMazeUI.Bar(new Rect(c.x - cw * 0.5f, c.y + 140f * s, cw, Mathf.Max(2f, 3f * s)), breathingCalm, MindMazeUI.Breath, breathVis);
+        }
+        else if (runTime < 25f)
+        {
+            float k = Mathf.Clamp01((25f - runTime) / 3f) * Mathf.Clamp01((runTime - 1f) / 1f);
+            MindMazeUI.Prompt(new Vector2(W * 0.5f, H - 64f * s), "Hold", "Space", "to breathe", 16f * s, 0.85f * k);
+        }
+
+        if (panic)
+        {
+            Vector2 j = Random.insideUnitCircle * 3f * s;
+            float k = 0.45f + 0.4f * Mathf.Abs(Mathf.Sin(Time.time * 9f));
+            MindMazeUI.Label(new Rect(j.x, H * 0.6f + j.y, W, 70f * s), "Can't breathe", MindMazeUI.DisplayItalic, 36f * s, MindMazeUI.A(Color.Lerp(bone, ember, 0.5f), k));
+        }
+    }
+
+    // ---------- end screens ----------
+    void DrawEnd()
+    {
+        float W = MindMazeUI.W, H = MindMazeUI.H, s = MindMazeUI.S;
+        var bone = MindMazeUI.Bone; var ash = MindMazeUI.Ash;
+        bool won = state == State.Won;
+
+        MindMazeUI.FillScreen(new Color(0, 0, 0, endFade * 0.9f));
+        MindMazeUI.VignetteScreen(new Color(0, 0, 0, endFade), 1.1f);
+        float f = Mathf.Clamp01(endFade * 1.5f);
+        float f2 = Mathf.Clamp01((endFade - 0.35f) * 2.2f);
+        float L = 112f * s;
+        float y = H * 0.24f;
+
+        MindMazeUI.Label(new Rect(L, y, W, 26f * s), won ? "Deadline reached" : "Deadline missed", MindMazeUI.Cond, 17f * s, MindMazeUI.A(won ? MindMazeUI.Breath : MindMazeUI.Ember, f), TextAnchor.MiddleLeft);
+        y += 34f * s;
+        float ts = Mathf.Min(88f * s, W * 0.065f);
+        MindMazeUI.Label(new Rect(L - 4f * s, y, W, ts * 1.3f), won ? "You made it." : "You didn't make it.", MindMazeUI.Display, ts, MindMazeUI.A(bone, f), TextAnchor.MiddleLeft, false, 0.9f);
+        y += ts * 1.3f + 6f * s;
+        MindMazeUI.Label(new Rect(L, y, W, 36f * s), won ? "…but the next deadline is already waiting." : "You tried so hard. It still wasn't enough.", MindMazeUI.BodyMedium, 24f * s, MindMazeUI.A(ash, f), TextAnchor.MiddleLeft);
+        y += 90f * s;
+
+        if (f2 > 0f)
+        {
+            string[] lbl = { "Time in the maze", "Times hit", won ? "Time to spare" : "Times it moved" };
+            string[] val = { MMSS(runTime), hits.ToString(), won ? MMSS(timeLeft) : (goalSlips - slipsLeft).ToString() };
+            float x = L;
+            for (int i = 0; i < 3; i++)
+            {
+                MindMazeUI.Label(new Rect(x, y, 260f * s, 50f * s), val[i], MindMazeUI.Cond, 40f * s, MindMazeUI.A(bone, f2), TextAnchor.MiddleLeft);
+                MindMazeUI.Label(new Rect(x, y + 50f * s, 260f * s, 22f * s), lbl[i], MindMazeUI.Body, 15f * s, MindMazeUI.A(ash, f2), TextAnchor.MiddleLeft);
+                x += 220f * s;
+            }
+            y += 130f * s;
+
+            float mw = 560f * s;
+            string msg = "For people who live with panic attacks, the maze doesn't end when the game does. If this felt familiar, talking to someone you trust can help.";
+            float mh = MindMazeUI.Height(msg, MindMazeUI.Body, 17f * s, mw);
+            MindMazeUI.Label(new Rect(L, y, mw, mh), msg, MindMazeUI.Body, 17f * s, MindMazeUI.A(ash, 0.9f * f2), TextAnchor.UpperLeft, true);
+            y += mh + 60f * s;
+        }
+        else y += 130f * s + 120f * s;
+
+        if (endFade > 0.6f)
+        {
+            float p = 0.6f + 0.4f * Mathf.Abs(Mathf.Sin(Time.time * 2.2f));
+            MindMazeUI.PromptLeft(new Vector2(L, y), "Press", "Space", won ? "to play again" : "to try again", 19f * s, p * Mathf.Clamp01((endFade - 0.6f) * 4f));
+        }
+    }
+}
