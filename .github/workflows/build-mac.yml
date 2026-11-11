@@ -1,5 +1,4 @@
 name: Build MindMaze for Mac
-
 on:
   push:
     branches: [ main ]
@@ -21,6 +20,13 @@ jobs:
           key: Library-mac-${{ hashFiles('Assets/**', 'Packages/**', 'ProjectSettings/**') }}
           restore-keys: Library-mac-
 
+      - name: Activate Unity License
+        uses: buildalon/activate-unity-license@v1
+        with:
+          license: 'Personal'
+          username: ${{ secrets.UNITY_EMAIL }}
+          password: ${{ secrets.UNITY_PASSWORD }}
+
       - name: Build for macOS
         uses: game-ci/unity-builder@v4
         env:
@@ -31,6 +37,7 @@ jobs:
           targetPlatform: StandaloneOSX
           buildName: MindMaze
           unityVersion: 6000.0.85f1
+          allowDirtyBuild: true
 
       - name: Zip the .app
         run: |
